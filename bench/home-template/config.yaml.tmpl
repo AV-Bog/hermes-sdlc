@@ -1,0 +1,56 @@
+# Шаблон дома прогона. Плейсхолдеры __PLUGIN_ENABLED__ и __PLUGIN_MODE__ подставляет run.py.
+# Правило: здесь только то, что определяет условия задачи, и ничего, что несёт опыт агента
+# (никаких memories, skills, external_dirs, SOUL.md).
+
+model:
+  default: deepseek-flash
+  provider: deepseek
+  base_url: https://api.deepseek.com/v1
+  api_mode: chat_completions
+
+agent:
+  max_turns: 80
+  reasoning_effort: medium
+
+terminal:
+  backend: local
+  cwd: .
+  timeout: 120
+
+tool_loop_guardrails:
+  warnings_enabled: true
+  hard_stop_enabled: false
+  non_interactive_hard_stop_enabled: true
+  warn_after:
+    exact_failure: 2
+    same_tool_failure: 3
+    idempotent_no_progress: 2
+  hard_stop_after:
+    exact_failure: 5
+    same_tool_failure: 8
+    idempotent_no_progress: 5
+
+compression:
+  enabled: true
+  threshold_tokens: 256000
+
+# Память выключена жёстко: прогон не должен ничего уносить с собой.
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+
+display:
+  language: ru
+  show_reasoning: false
+  streaming: false
+  tool_progress: all
+
+plugins:
+  enabled: __PLUGIN_ENABLED__
+  entries:
+    hermes-sdlc:
+      settings:
+        mode: __PLUGIN_MODE__
+        root: .
+
+_config_version: 45

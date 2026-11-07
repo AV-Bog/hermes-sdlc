@@ -1,0 +1,7 @@
+# Мусор IDE и Finder внутри стенда (PyCharm создал .idea при открытии bench/)
+.idea/
+.DS_Store
+
+# Результаты прогонов и поставленный плагин — см. корневой .gitignore
+runs/
+home-template/plugins/

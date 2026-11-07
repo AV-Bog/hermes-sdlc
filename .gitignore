@@ -218,3 +218,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Стенд: результаты прогонов и ключи прогона
+bench/runs/
+bench/home-template/plugins/
+
+# Ключ ответов стенда: публикуется ПОСЛЕ финальной серии прогонов.
+# Не добавлять через git add -f.
+bench/tasks/*/truth.md
+bench/tasks/*/grader.py
+
+# Редакторы и мусор
+.idea/
+.DS_Store
+__pycache__/
