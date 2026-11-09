@@ -7,10 +7,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -21,7 +23,14 @@ REPO = BENCH.parent
 RUNS = BENCH / "runs"
 STATE_ROOT = Path.home() / ".hermes" / "bench"
 MAIN_PROFILE_HOME = Path.home() / ".hermes"
-ARMS = ("off", "advisory", "enforce")
+ARMS = ("off", "skill", "advisory", "enforce")
+
+# Скил — единственный источник текста напоминания: в плече `skill` он ставится как есть, плагин
+# берёт из него тело (всё после шапки) и добавляет строку про текущий шаг. Почему — `bench/README.md`.
+SKILL_SRC = REPO / "plugin" / "hermes-sdlc" / "SKILL.md"
+SKILL_NAME = "sdlc-stages"
+NO_BUNDLED_SKILLS = ".no-bundled-skills"
+SKILL_TOOLS = ("skill_view", "skills_list")
 
 
 def sh(cmd: list[str], cwd: Path | None = None, timeout: int | None = None) -> subprocess.CompletedProcess:
@@ -29,14 +38,14 @@ def sh(cmd: list[str], cwd: Path | None = None, timeout: int | None = None) -> s
 
 
 def sandbox_profile(run_dir: Path, project: Path, home: Path) -> str:
-    """SBPL-профиль прогона: запрет чтения ответов и записи в служебные файлы.
+    """Профиль песочницы для `sandbox-exec`: запрет чтения ответов и записи в служебные файлы.
 
     Пути обязаны быть каноничными (resolve), порядок правил важен — почему, в `bench/README.md`.
     """
     deny_read = [REPO, run_dir, MAIN_PROFILE_HOME / "memories", MAIN_PROFILE_HOME / "skills"]
     # Плагин и конфиг принадлежат экспериментатору, а не субъекту прогона.
     deny_write_dirs = [
-        home / "plugins",
+        home / "plugins", home / "skills",
         MAIN_PROFILE_HOME / "memories", MAIN_PROFILE_HOME / "skills", MAIN_PROFILE_HOME / "plugins",
         REPO,
     ]
@@ -64,14 +73,44 @@ def read_plugin_marker(home: Path) -> dict | None:
 
 
 
-def verify_arm(arm: str, home: Path) -> tuple[dict | None, str | None]:
+def skill_body(text: str) -> str:
+    """Тело скила: всё после шапки. Его плагин вставляет в ход — поэтому хеш считается от него."""
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            return text[end + 4:].lstrip("\n")
+    return text
+
+
+def install_skill(home: Path) -> str:
+    """Кладёт скил в дом прогона как есть и возвращает sha256 файла.
+
+    Скил — пассивная доставка: в системный промпт попадает только `description`, текст
+    читается инструментом `skill_view` по решению агента. Поэтому файл кладётся ровно один
+    и его хеш пишется в `meta.json`: открыл агент скил или нет — факт прогона.
+    """
+    target = home / "skills" / SKILL_NAME
+    target.mkdir(parents=True, exist_ok=True)
+    skill_file = target / "SKILL.md"
+    shutil.copyfile(SKILL_SRC, skill_file)
+    return hashlib.sha256(skill_file.read_bytes()).hexdigest()
+
+
+def verify_arm(arm: str, home: Path, skill_sha256: str | None) -> tuple[dict | None, str | None]:
     """Проверка, что прогон действительно идёт в том плече, которое заявлено.
 
-    Возвращает (отметка плагина, причина невалидности или None).
+    Возвращает (отметка о загрузке плеча, причина невалидности или None).
     """
     loaded = read_plugin_marker(home)
     if arm == "off":
         return loaded, None
+    if arm == "skill":
+        skill_file = home / "skills" / SKILL_NAME / "SKILL.md"
+        if not skill_file.is_file():
+            return None, f"нет {skill_file}: плечо skill не на что опирать"
+        if skill_sha256 and hashlib.sha256(skill_file.read_bytes()).hexdigest() != skill_sha256:
+            return None, "SKILL.md изменился после установки: мерили не тот текст"
+        return {"skill": SKILL_NAME, "sha256": skill_sha256}, None
     if loaded is None:
         return None, "плагин не оставил отметку о загрузке: мерили не то плечо"
     mode = loaded.get("mode")
@@ -83,11 +122,22 @@ def verify_arm(arm: str, home: Path) -> tuple[dict | None, str | None]:
 def build_home(home: Path, arm: str, env_file: Path, plugin_src: Path) -> dict:
     home.mkdir(parents=True, exist_ok=True)
     tmpl = (BENCH / "home-template" / "config.yaml.tmpl").read_text(encoding="utf-8")
-    enabled = "[]" if arm == "off" else "[hermes-sdlc]"
+    enabled = "[]" if arm in ("off", "skill") else "[hermes-sdlc]"
     config = tmpl.replace("__PLUGIN_ENABLED__", enabled).replace("__PLUGIN_MODE__", arm)
     (home / "config.yaml").write_text(config, encoding="utf-8")
 
+    # Иначе Hermes дошлёт в дом встроенную библиотеку скилов и плечо `off` перестанет быть базой.
+    (home / NO_BUNDLED_SKILLS).write_text(
+        "Дом стенда: встроенные скилы не нужны, кроме hermes-agent (см. bench/README.md).\n",
+        encoding="utf-8")
+
     notes: dict = {"plugin_installed": False, "env_copied": False}
+
+    if SKILL_SRC.is_file():
+        notes["reminder_sha256"] = hashlib.sha256(
+            skill_body(SKILL_SRC.read_text(encoding="utf-8")).encode("utf-8")).hexdigest()
+    else:
+        notes["reminder_warning"] = f"нет скила с текстом напоминания ({SKILL_SRC})"
 
     if env_file.exists():
         shutil.copyfile(env_file, home / ".env")
@@ -96,16 +146,35 @@ def build_home(home: Path, arm: str, env_file: Path, plugin_src: Path) -> dict:
     else:
         notes["env_warning"] = f"нет {env_file}: прогон упадёт без ключей"
 
-    if arm != "off":
+    if arm == "skill":
+        notes["skill_sha256"] = install_skill(home)
+        notes["skill_installed"] = True
+
+    if arm in ("advisory", "enforce"):
         target = home / "plugins" / "hermes-sdlc"
-        if plugin_src.is_dir():
+        if (plugin_src / "plugin.yaml").is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(plugin_src, target, dirs_exist_ok=True)
             notes["plugin_installed"] = True
         else:
-            notes["plugin_warning"] = f"плагина ещё нет ({plugin_src}) — плечо {arm} не на что опирать"
+            notes["plugin_warning"] = f"плагина ещё нет (нет {plugin_src / 'plugin.yaml'}) — плечо {arm} не на что опирать"
 
     return notes
+
+
+def count_skill_reads(home: Path) -> int | None:
+    """Сколько раз агент открывал скилы. None — базы нет, факт неизвестен, а не «ноль»."""
+    db = home / "state.db"
+    if not db.is_file():
+        return None
+    marks = ", ".join("?" * len(SKILL_TOOLS))
+    query = (f"SELECT COUNT(*) FROM messages WHERE tool_name IN ({marks}) "
+             f"OR tool_calls LIKE '%\"skill_view\"%' OR tool_calls LIKE '%\"skills_list\"%'")
+    try:
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+            return int(conn.execute(query, SKILL_TOOLS).fetchone()[0])
+    except sqlite3.Error:
+        return None
 
 
 def build_project(project: Path, seed: Path) -> None:
@@ -134,6 +203,13 @@ def main() -> int:
         return 2
     if not (task_dir / "grader.py").is_file():
         print(f"нет grader.py в {task_dir}", file=sys.stderr)
+        return 2
+    if args.arm in ("skill", "advisory", "enforce") and not SKILL_SRC.is_file():
+        print(f"нет скила с текстом напоминания: {SKILL_SRC}", file=sys.stderr)
+        return 2
+    if args.arm in ("advisory", "enforce") and not args.dry_run \
+            and not (REPO / "plugin" / "hermes-sdlc" / "plugin.yaml").is_file():
+        print(f"плагина нет: плечо {args.arm} не на что опирать (и прогон не засчитается)", file=sys.stderr)
         return 2
 
     run_dir = (RUNS / args.task / f"{args.arm}-{args.n:02d}").resolve()
@@ -194,9 +270,11 @@ def main() -> int:
     # Без отметки `enforce` может тихо измерить `off`.
     if args.dry_run:
         meta["plugin"], meta["valid"] = None, None
+        meta["skill_reads"] = None
     else:
-        loaded, reason = verify_arm(args.arm, home)
+        loaded, reason = verify_arm(args.arm, home, notes.get("skill_sha256"))
         meta["plugin"], meta["valid"] = loaded, reason is None
+        meta["skill_reads"] = count_skill_reads(home)
         if reason:
             meta["invalid_reason"] = reason
 
@@ -217,15 +295,20 @@ def main() -> int:
     print(f"плечо:  {args.arm}   агент: {agent_label}   изоляция: "
           f"{'sandbox-exec' if meta.get('sandbox') else 'нет'}")
     if meta.get("valid") is True:
-        print(f"плагин: загружен {meta['plugin']}")
+        if args.arm == "skill":
+            print(f"скил:  установлен {SKILL_NAME}")
+        else:
+            print(f"плагин: загружен {meta['plugin']}")
     elif meta.get("valid") is False:
         print(f"ПРОГОН НЕ ЗАСЧИТАН: {meta['invalid_reason']}")
-    for key in ("plugin_warning", "env_warning", "sandbox_warning", "grader_error"):
+    for key in ("plugin_warning", "skill_warning", "reminder_warning", "env_warning", "sandbox_warning", "grader_error"):
         if meta.get(key):
             print(f"! {meta[key]}")
     if verdict.exists():
         print("вердикт: " + json.loads(verdict.read_text(encoding="utf-8"))["summary"])
     print(f"изменено файлов: {len(meta['changed_files'])}")
+    if meta.get("skill_reads") is not None:
+        print(f"открытий скилов: {meta['skill_reads']}")
     return 0
 
 
