@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Один прогон стенда: дом агента, песочница, запуск, вердикт.
 
-Как запускать, что лежит в каталоге прогона и как устроена изоляция — в `bench/README.md`.
+Как запускать, что лежит в каталоге прогона и как устроена изоляция - в `bench/README.md`.
 """
 
 from __future__ import annotations
@@ -25,12 +25,15 @@ STATE_ROOT = Path.home() / ".hermes" / "bench"
 MAIN_PROFILE_HOME = Path.home() / ".hermes"
 ARMS = ("off", "skill", "advisory", "enforce")
 
-# Скил — единственный источник текста напоминания: в плече `skill` он ставится как есть, плагин
-# берёт из него тело (всё после шапки) и добавляет строку про текущий шаг. Почему — `bench/README.md`.
+# Скил - единственный источник текста напоминания: в плече `skill` он ставится как есть, плагин
+# берёт из него тело (всё после шапки) и добавляет строку про текущий шаг. Почему - `bench/README.md`.
 SKILL_SRC = REPO / "plugin" / "hermes-sdlc" / "SKILL.md"
 SKILL_NAME = "sdlc-stages"
 NO_BUNDLED_SKILLS = ".no-bundled-skills"
-SKILL_TOOLS = ("skill_view", "skills_list")
+SKILL_TOOLS = ("skill_view", "skills_list")  # имена Hermes v0.21.4: при обновлении сверить
+# Признаки того, что агент прочитал служебные файлы прогона: имя плагина, маркер профиля,
+# отметка о загрузке плагина. По ним считается `leaks` в `meta.json`.
+LEAK_MARKERS = ("hermes-sdlc", ".no-bundled-skills", "sdlc-loaded")
 
 
 def sh(cmd: list[str], cwd: Path | None = None, timeout: int | None = None) -> subprocess.CompletedProcess:
@@ -40,9 +43,10 @@ def sh(cmd: list[str], cwd: Path | None = None, timeout: int | None = None) -> s
 def sandbox_profile(run_dir: Path, project: Path, home: Path) -> str:
     """Профиль песочницы для `sandbox-exec`: запрет чтения ответов и записи в служебные файлы.
 
-    Пути обязаны быть каноничными (resolve), порядок правил важен — почему, в `bench/README.md`.
+    Пути обязаны быть каноничными (resolve), порядок правил важен - почему, в `bench/README.md`.
     """
-    deny_read = [REPO, run_dir, MAIN_PROFILE_HOME / "memories", MAIN_PROFILE_HOME / "skills"]
+    deny_read = [REPO, run_dir, MAIN_PROFILE_HOME / "memories", MAIN_PROFILE_HOME / "skills",
+                 home.parent / "meta.json"]
     # Плагин и конфиг принадлежат экспериментатору, а не субъекту прогона.
     deny_write_dirs = [
         home / "plugins", home / "skills",
@@ -62,7 +66,7 @@ def sandbox_profile(run_dir: Path, project: Path, home: Path) -> str:
 
 
 def read_plugin_marker(home: Path) -> dict | None:
-    """Отметка плагина о загрузке: `$HERMES_HOME/sdlc-loaded.json`. Зачем — в `bench/README.md`."""
+    """Отметка плагина о загрузке: `$HERMES_HOME/sdlc-loaded.json`. Зачем - в `bench/README.md`."""
     marker = home / "sdlc-loaded.json"
     if not marker.exists():
         return None
@@ -74,7 +78,7 @@ def read_plugin_marker(home: Path) -> dict | None:
 
 
 def skill_body(text: str) -> str:
-    """Тело скила: всё после шапки. Его плагин вставляет в ход — поэтому хеш считается от него."""
+    """Тело скила: всё после шапки. Его плагин вставляет в ход - поэтому хеш считается от него."""
     if text.startswith("---"):
         end = text.find("\n---", 3)
         if end != -1:
@@ -83,12 +87,7 @@ def skill_body(text: str) -> str:
 
 
 def install_skill(home: Path) -> str:
-    """Кладёт скил в дом прогона как есть и возвращает sha256 файла.
-
-    Скил — пассивная доставка: в системный промпт попадает только `description`, текст
-    читается инструментом `skill_view` по решению агента. Поэтому файл кладётся ровно один
-    и его хеш пишется в `meta.json`: открыл агент скил или нет — факт прогона.
-    """
+    """Кладёт скил в дом прогона и возвращает sha256 файла: так видно, что мерили именно его."""
     target = home / "skills" / SKILL_NAME
     target.mkdir(parents=True, exist_ok=True)
     skill_file = target / "SKILL.md"
@@ -103,7 +102,16 @@ def verify_arm(arm: str, home: Path, skill_sha256: str | None) -> tuple[dict | N
     """
     loaded = read_plugin_marker(home)
     if arm == "off":
-        return loaded, None
+        # Отметки мало: плагин мог не записать её, но остаться в доме. Проверяем сам дом.
+        if loaded is not None:
+            return loaded, f"плечо off, а плагин оставил отметку {loaded!r}: это не пустая база"
+        plugin_dir = home / "plugins" / "hermes-sdlc"
+        if plugin_dir.exists():
+            return None, f"плечо off, а в доме лежит плагин: {plugin_dir}"
+        config_file = home / "config.yaml"
+        if config_file.is_file() and "hermes-sdlc" in config_file.read_text(encoding="utf-8"):
+            return None, "плечо off, а в config.yaml упомянут hermes-sdlc"
+        return None, None
     if arm == "skill":
         skill_file = home / "skills" / SKILL_NAME / "SKILL.md"
         if not skill_file.is_file():
@@ -123,13 +131,23 @@ def build_home(home: Path, arm: str, env_file: Path, plugin_src: Path) -> dict:
     home.mkdir(parents=True, exist_ok=True)
     tmpl = (BENCH / "home-template" / "config.yaml.tmpl").read_text(encoding="utf-8")
     enabled = "[]" if arm in ("off", "skill") else "[hermes-sdlc]"
+    if arm in ("off", "skill"):
+        # Плечо без плагина не должно даже упоминать его: имя плагина и `mode` в config.yaml -
+        # подсказка агенту, что его проверяют. Раньше блок `entries` оставался во всех плечах.
+        tmpl = tmpl.replace(
+            "  entries:\n    hermes-sdlc:\n      settings:\n        mode: __PLUGIN_MODE__\n"
+            "        root: .\n", "")
+        if "hermes-sdlc" in tmpl:
+            # Замена по тексту: если шаблон отформатируют иначе, она молча не сработает.
+            raise RuntimeError(
+                "в шаблоне дома не вырезался блок plugins.entries - плечо "
+                f"{arm!r} получило бы имя плагина в config.yaml; поправь home-template/config.yaml.tmpl")
     config = tmpl.replace("__PLUGIN_ENABLED__", enabled).replace("__PLUGIN_MODE__", arm)
     (home / "config.yaml").write_text(config, encoding="utf-8")
 
     # Иначе Hermes дошлёт в дом встроенную библиотеку скилов и плечо `off` перестанет быть базой.
     (home / NO_BUNDLED_SKILLS).write_text(
-        "Дом стенда: встроенные скилы не нужны, кроме hermes-agent (см. bench/README.md).\n",
-        encoding="utf-8")
+        "В этом профиле встроенные скилы не разворачиваются.\n", encoding="utf-8")
 
     notes: dict = {"plugin_installed": False, "env_copied": False}
 
@@ -157,28 +175,106 @@ def build_home(home: Path, arm: str, env_file: Path, plugin_src: Path) -> dict:
             shutil.copytree(plugin_src, target, dirs_exist_ok=True)
             notes["plugin_installed"] = True
         else:
-            notes["plugin_warning"] = f"плагина ещё нет (нет {plugin_src / 'plugin.yaml'}) — плечо {arm} не на что опирать"
+            notes["plugin_warning"] = f"плагина ещё нет (нет {plugin_src / 'plugin.yaml'}) - плечо {arm} не на что опирать"
 
     return notes
 
 
 def count_skill_reads(home: Path) -> int | None:
-    """Сколько раз агент открывал скилы. None — базы нет, факт неизвестен, а не «ноль»."""
+    """Сколько раз агент открывал скилы. None - базы нет, факт неизвестен, а не «ноль».
+
+    Считаются вызовы внутри `tool_calls`: один вызов даёт две строки, и COUNT по строкам
+    давал удвоенное число.
+    """
     db = home / "state.db"
     if not db.is_file():
         return None
-    marks = ", ".join("?" * len(SKILL_TOOLS))
-    query = (f"SELECT COUNT(*) FROM messages WHERE tool_name IN ({marks}) "
-             f"OR tool_calls LIKE '%\"skill_view\"%' OR tool_calls LIKE '%\"skills_list\"%'")
+    conn = None
     try:
-        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
-            return int(conn.execute(query, SKILL_TOOLS).fetchone()[0])
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT tool_calls FROM messages WHERE tool_calls LIKE '%skill%'").fetchall()
     except sqlite3.Error:
         return None
+    finally:
+        if conn is not None:
+            conn.close()
+    calls = 0
+    for (raw,) in rows:
+        try:
+            items = json.loads(raw or "[]")
+        except (TypeError, ValueError):
+            continue
+        for item in items if isinstance(items, list) else []:
+            name = (item.get("function") or {}).get("name") if isinstance(item, dict) else None
+            if name in SKILL_TOOLS:
+                calls += 1
+    return calls
+
+
+def count_leaks(home: Path) -> int | None:
+    """Сколько сообщений содержит признаки стенда. Одно сообщение с двумя маркерами - одно.
+    Это индикатор, а не доказательство: слово может попасть в ответ, и наоборот."""
+    db = home / "state.db"
+    if not db.is_file():
+        return None
+    clauses = " OR ".join("content LIKE ?" for _ in LEAK_MARKERS)
+    params = tuple(f"%{marker}%" for marker in LEAK_MARKERS)
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        return int(conn.execute(f"SELECT COUNT(*) FROM messages WHERE {clauses}", params).fetchone()[0])
+    except sqlite3.Error:
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+
+def usage_db(home: Path) -> dict | None:
+    """Сумма по всем сессиям прогона: `--usage-file` считает субагентов в деньгах, но не в
+    вызовах и токенах. Служебные вызовы (непустой `task`) считаются отдельно."""
+    db = home / "state.db"
+    if not db.is_file():
+        return None
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT session_id, task, api_call_count, input_tokens, output_tokens,"
+            " cache_read_tokens, cache_write_tokens, reasoning_tokens, estimated_cost_usd"
+            " FROM session_model_usage").fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+    if not rows:
+        return None
+
+    def total(items: list, index: int) -> int:
+        return sum(int(row[index] or 0) for row in items)
+
+    main = [row for row in rows if not (row[1] or "").strip()]
+    aux = [row for row in rows if (row[1] or "").strip()]
+    return {
+        "sessions": len({row[0] for row in rows}),
+        "api_calls": total(main, 2),
+        "api_calls_aux": total(aux, 2),
+        "input_tokens": total(main, 3),
+        "output_tokens": total(main, 4),
+        "cache_read_tokens": total(main, 5),
+        "cache_write_tokens": total(main, 6),
+        "reasoning_tokens": total(main, 7),
+        "cost_usd": round(sum(float(row[8] or 0) for row in rows), 6),
+    }
 
 
 def build_project(project: Path, seed: Path) -> None:
-    shutil.copytree(seed, project, dirs_exist_ok=True)
+    """Копия `seed/` в песочницу за вычетом `.gitkeep`: он держит пустой каталог в git и в
+    проекте агента был бы мусором (у `job-queue` кода нет вообще)."""
+    shutil.copytree(seed, project, ignore=shutil.ignore_patterns(".gitkeep"), dirs_exist_ok=True)
     sh(["git", "init", "-q"], cwd=project)
     sh(["git", "add", "-A"], cwd=project)
     sh(["git", "-c", "user.email=bench@local", "-c", "user.name=bench",
@@ -275,6 +371,8 @@ def main() -> int:
         loaded, reason = verify_arm(args.arm, home, notes.get("skill_sha256"))
         meta["plugin"], meta["valid"] = loaded, reason is None
         meta["skill_reads"] = count_skill_reads(home)
+        meta["leaks"] = count_leaks(home)
+        meta["usage_db"] = usage_db(home)
         if reason:
             meta["invalid_reason"] = reason
 
@@ -309,6 +407,15 @@ def main() -> int:
     print(f"изменено файлов: {len(meta['changed_files'])}")
     if meta.get("skill_reads") is not None:
         print(f"открытий скилов: {meta['skill_reads']}")
+    usage = meta.get("usage_db")
+    if usage:
+        tokens = usage["input_tokens"] + usage["output_tokens"]
+        print(f"цена по базе: {usage['api_calls']} вызовов, {tokens} токенов, "
+              f"${usage['cost_usd']:.4f}, сессий {usage['sessions']}")
+        if usage["sessions"] > 1:
+            print("! работал субагент: в usage.json токены и вызовы только по родителю")
+    if meta.get("leaks"):
+        print(f"! агент видел служебные файлы прогона: {meta['leaks']} сообщений с признаками")
     return 0
 
 

@@ -1,0 +1,13 @@
+name: sdlc-spike
+version: 0.0.1
+description: "Одноразовый плагин спайка M0: журнал хуков и блокировка инструментов по списку из окружения."
+author: "hermes-sdlc spike"
+hooks:
+  - on_session_start
+  - pre_llm_call
+  - pre_api_request
+  - pre_tool_call
+  - post_tool_call
+  - pre_verify
+  - subagent_start
+  - subagent_stop
