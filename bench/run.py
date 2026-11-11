@@ -31,9 +31,10 @@ SKILL_SRC = REPO / "plugin" / "hermes-sdlc" / "SKILL.md"
 SKILL_NAME = "sdlc-stages"
 NO_BUNDLED_SKILLS = ".no-bundled-skills"
 SKILL_TOOLS = ("skill_view", "skills_list")  # имена Hermes v0.21.4: при обновлении сверить
-# Признаки того, что агент прочитал служебные файлы прогона: имя плагина, маркер профиля,
-# отметка о загрузке плагина. По ним считается `leaks` в `meta.json`.
-LEAK_MARKERS = ("hermes-sdlc", ".no-bundled-skills", "sdlc-loaded")
+# Признаки того, что агент прочитал служебные файлы прогона: отметка о загрузке плагина и маркер
+# профиля. Имя репозитория в маркерах намеренно нет: оно стоит в пути рабочего каталога, и признак
+# срабатывал на каждом прогоне - шум вместо индикатора.
+LEAK_MARKERS = ("sdlc-loaded", NO_BUNDLED_SKILLS)
 
 
 def sh(cmd: list[str], cwd: Path | None = None, timeout: int | None = None) -> subprocess.CompletedProcess:
@@ -62,6 +63,15 @@ def sandbox_profile(run_dir: Path, project: Path, home: Path) -> str:
     lines.append(f'(allow file-read* (subpath "{project}"))')
     lines += [f'(deny file-write* (subpath "{p}"))' for p in deny_write_dirs]
     lines += [f'(deny file-write* (literal "{p}"))' for p in deny_write_files]
+    # Песочница лежит внутри репозитория, поэтому запрет записи в репозиторий закрывает и её.
+    # Исключение для проекта - идёт последним: побеждает последнее совпавшее правило.
+    lines.append(f'(allow file-write* (subpath "{project}"))')
+    # Исключение из запрета записи: сам каталог `skills` и `plugins` в доме. Hermes при
+    # инициализации ставит на них права (chmod), а `file-write*` включает смену прав, и прогон
+    # падал на старте с "Cannot initialize Hermes directory". Содержимое по-прежнему закрыто:
+    # `literal` совпадает только с самим каталогом, не с файлами внутри. Побеждает последнее
+    # совпавшее правило - поэтому строка стоит после запретов.
+    lines += [f'(allow file-write* (literal "{home / subdir}"))' for subdir in ("skills", "plugins")]
     return "\n".join(lines) + "\n"
 
 
@@ -150,6 +160,11 @@ def build_home(home: Path, arm: str, env_file: Path, plugin_src: Path) -> dict:
         "В этом профиле встроенные скилы не разворачиваются.\n", encoding="utf-8")
 
     notes: dict = {"plugin_installed": False, "env_copied": False}
+
+    # Каталоги, в которые Hermes при старте делает mkdir/chmod сам (инициализация дома).
+    # Создать их заранее дешевле, чем ослаблять изоляцию: проверка ниже (sandbox_profile).
+    for subdir in ("skills", "plugins"):
+        (home / subdir).mkdir(parents=True, exist_ok=True)
 
     if SKILL_SRC.is_file():
         notes["reminder_sha256"] = hashlib.sha256(
@@ -313,8 +328,9 @@ def main() -> int:
     if run_dir.exists() or state_dir.exists():
         print(f"прогон уже есть: {run_dir} (удали или возьми другой --n)", file=sys.stderr)
         return 2
-    home, project = state_dir / "home", run_dir / "project"
+    home, project = state_dir / "home", state_dir / "project"
     run_dir.mkdir(parents=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
 
     prompt = (task_dir / "TASK.md").read_text(encoding="utf-8")
     notes = build_home(home, args.arm, args.env_file.resolve(), REPO / "plugin" / "hermes-sdlc")
@@ -329,6 +345,7 @@ def main() -> int:
         "timeout_s": args.timeout,
         "dry_run": args.dry_run,
         "home": str(home),
+        "project": str(project),
         **notes,
     }
 
@@ -341,7 +358,9 @@ def main() -> int:
         (run_dir / "transcript.log").write_text("", encoding="utf-8")
     else:
         if sandboxed:
-            profile = state_dir / "sandbox.sb"
+            # Профиль пишется в каталог прогона: он закрыт на чтение, иначе агент читает список
+            # своих запретов по именам (в первом прогоне так и было: он сослался на строку профиля).
+            profile = run_dir / "sandbox.sb"
             profile.write_text(sandbox_profile(run_dir, project, home), encoding="utf-8")
             cmd = ["sandbox-exec", "-f", str(profile)] + cmd
             meta["sandbox"] = str(profile)
@@ -375,6 +394,14 @@ def main() -> int:
         meta["usage_db"] = usage_db(home)
         if reason:
             meta["invalid_reason"] = reason
+        # Прогон, где агент не отработал, не является точкой замера: без этой проверки упавший
+        # старт (0.9 с, 0 изменённых файлов) попадал в таблицу как валидная база плеча `off`.
+        if meta.get("timed_out"):
+            meta["valid"], meta["invalid_reason"] = False, f"прерван по таймауту {args.timeout} с"
+        elif meta.get("agent_exit") != 0:
+            meta["valid"], meta["invalid_reason"] = False, (
+                f"агент завершился с кодом {meta.get('agent_exit')}, прогона нет: "
+                f"смотреть transcript.log")
 
     verdict = run_dir / "verdict.json"
     g = sh([sys.executable, str(task_dir / "grader.py"), "--project", str(project), "--out", str(verdict)])
@@ -390,6 +417,7 @@ def main() -> int:
     agent_label = meta.get("agent") or f"exit {meta.get('agent_exit')}"
     print(f"прогон: {run_dir.relative_to(REPO)}")
     print(f"дом:    {home}")
+    print(f"проект: {meta['project']}")
     print(f"плечо:  {args.arm}   агент: {agent_label}   изоляция: "
           f"{'sandbox-exec' if meta.get('sandbox') else 'нет'}")
     if meta.get("valid") is True:
