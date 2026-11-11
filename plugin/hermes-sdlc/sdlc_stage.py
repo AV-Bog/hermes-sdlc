@@ -33,6 +33,25 @@ _HEADER = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*$")
 _BOLD_HEADER = re.compile(r"^\s{0,3}\*\*(.+?)\*\*\s*:?\s*$")
 _BULLET = re.compile(r"^\s*[-*+]\s+(.*)$")
 _PATH_LIKE = re.compile(r"^[A-Za-z0-9_./-]+$")
+# Нумерация в заголовке: агент пишет `## 3. Архитектура` и `## 7. Файлы`, и без снятия номера
+# раздел не опознаётся. Число в начале строки не делает план хуже.
+_ENUMERATION = re.compile(r"^(?:раздел\s*)?\d+[.)]?\s+")
+
+# Синонимы названий разделов. План пишется словами, а не по шаблону, и запирать его из-за
+# синонима значило бы требовать не содержание, а формулировку.
+ALIASES = {
+    "что делаем": "функциональность",
+    "функционал": "функциональность",
+    "функциональность и поведение": "функциональность",
+    "требования и критерии приемки": "требования",
+    "критерии приемки": "требования",
+    "вопросы": "вопросы и допущения",
+    "допущения": "вопросы и допущения",
+}
+
+# Где искать список файлов. «Архитектура» - место по §5, но отдельный раздел «Файлы» читается
+# так же однозначно, и требовать только первый вариант незачем.
+FILE_SECTIONS: Tuple[str, ...] = (ARCH_SECTION, "файлы", "файлы проекта", "список файлов")
 
 
 @dataclass(frozen=True)
@@ -46,7 +65,9 @@ class Inspection:
 
 
 def _normalise(text: str) -> str:
-    return " ".join(text.replace("ё", "е").replace("Ё", "Е").split()).strip(" :#").lower()
+    value = " ".join(text.replace("ё", "е").replace("Ё", "Е").split()).strip(" :#").lower()
+    value = _ENUMERATION.sub("", value).strip(" :#")
+    return ALIASES.get(value, value)
 
 
 def sections(text: str) -> Tuple[Tuple[str, int], ...]:
@@ -90,26 +111,26 @@ def _looks_like_path(candidate: str) -> bool:
 
 
 def declared_files(text: str) -> Tuple[str, ...]:
-    """Файлы из списка в разделе «Архитектура», в порядке объявления.
+    """Файлы из списка в разделе «Архитектура» или в отдельном разделе «Файлы», по порядку.
 
     Строка списка - это `- src/parser.py`. Снимаются маркеры списка, обратные кавычки и кавычки;
     хвост после первого пробела отбрасывается, чтобы `- src/app.py (новый)` тоже считался путём.
     """
     headers = sections(text)
-    body = _section_body(text, headers, ARCH_SECTION)
     seen, files = set(), []
-    for line in body.splitlines():
-        match = _BULLET.match(line)
-        if not match:
-            continue
-        raw = match.group(1).strip().strip("`'\"").strip()
-        candidate = raw.split()[0].strip("`'\",;").rstrip(".") if raw else ""
-        if not _looks_like_path(candidate):
-            continue
-        normalised = str(Path(candidate))
-        if normalised not in seen:
-            seen.add(normalised)
-            files.append(normalised)
+    for section in FILE_SECTIONS:
+        for line in _section_body(text, headers, section).splitlines():
+            match = _BULLET.match(line)
+            if not match:
+                continue
+            raw = match.group(1).strip().strip("`'\"").strip()
+            candidate = raw.split()[0].strip("`'\",;").rstrip(".") if raw else ""
+            if not _looks_like_path(candidate):
+                continue
+            normalised = str(Path(candidate))
+            if normalised not in seen:
+                seen.add(normalised)
+                files.append(normalised)
     return tuple(files)
 
 

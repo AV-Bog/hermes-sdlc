@@ -11,6 +11,36 @@ from helpers import DESIGN_NO_FILES, DESIGN_OK, sub
 stage = sub("sdlc_stage")
 
 
+DESIGN_NUMBERED = """# Очередь задач по HTTP: дизайн
+
+## 1. Что делаем
+
+Сервис принимает задачи по HTTP и отдаёт результат, когда он готов.
+
+## 2. Требования и критерии приёмки
+
+- Принятая задача не теряется.
+
+## 3. Архитектура
+
+Обработчик HTTP и хранилище задач, описание словами.
+
+### HTTP-слой
+
+Отдельный обработчик на каждый путь.
+
+## 7. Файлы
+
+- server.py
+- jobs.py
+- `tests/test_server.py`
+
+## 8. Вопросы и допущения
+
+- Хранение в памяти: уточнить, нужно ли переживать перезапуск.
+"""
+
+
 class InspectTest(unittest.TestCase):
     def test_no_design_file_means_design_stage(self) -> None:
         result = stage.inspect(None)
@@ -54,6 +84,22 @@ class InspectTest(unittest.TestCase):
         text = DESIGN_OK.replace("- tests/test_store.py", "- src/store.py\n- tests/test_store.py")
         files = stage.declared_files(text)
         self.assertEqual(files.count("src/store.py"), 1)
+
+    def test_numbered_sections_are_recognised(self) -> None:
+        """Прогон M1: агент пишет `## 3. Архитектура`, и без снятия номера раздел не виден."""
+        result = stage.inspect(DESIGN_NUMBERED)
+        self.assertEqual(result.missing_sections, ())
+        self.assertEqual(result.stage, stage.CODE)
+
+    def test_file_list_in_own_section(self) -> None:
+        result = stage.inspect(DESIGN_NUMBERED)
+        self.assertEqual(result.files, ("server.py", "jobs.py", "tests/test_server.py"))
+
+    def test_section_alias_accepted(self) -> None:
+        """«Что делаем» - то же, что «Функциональность»: план читают по смыслу, не по шаблону."""
+        text = DESIGN_NUMBERED
+        text = text.replace("## 1. Что делаем", "## 1. Функциональность")
+        self.assertEqual(stage.inspect(text).stage, stage.CODE)
 
     def test_links_are_not_paths(self) -> None:
         text = DESIGN_NO_FILES.replace("Сервер принимает задачи и складывает в очередь.",
