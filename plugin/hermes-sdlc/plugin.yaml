@@ -1,0 +1,15 @@
+name: hermes-sdlc
+version: 0.1.0
+description: "Этапы разработки: этап выводится из файлов проекта, действие, несовместимое с этапом, блокируется до исполнения."
+author: "Богданова Арина"
+license: MIT
+hooks:
+  - on_session_start
+  - pre_llm_call
+  - pre_tool_call
+  - post_tool_call
+provides_hooks:
+  - on_session_start
+  - pre_llm_call
+  - pre_tool_call
+  - post_tool_call
